@@ -1,0 +1,251 @@
+# Build WQFiles.ipa and publish it on the GitHub release for that tag.
+#
+# Pushing a tag such as v0.9.5 (it must match CFBundleShortVersionString)
+# checks out that tag, runs ./build.sh, and uploads WQFiles.ipa.
+# The release title is "Worse Query Files 0.9.5". The notes open with a
+# notice that this IPA was built by GitHub Actions from that tag's source.
+# A leftover WQFiles_<tag>.ipa asset, if a previous run uploaded one, is removed.
+#
+# If the release does not exist yet, it is created. An existing release gets
+# that title, the Actions notice, and an updated SHA-256 line.
+#
+# GitHub only shows "Run workflow" after this file is on the default branch,
+# and a tag that already exists does not push again. Until then, pushing
+# feature/workflow publishes the latest tag when this file is part of the
+# push, or when the commit message contains [release]. [release v0.9.4]
+# publishes that tag instead of the latest one.
+#
+# xcode-27 is the arm64 preview image whose Xcode 27.2 has the iPhoneOS
+# 27.2 SDK. The image default is Xcode 27.1, so the job selects 27.2.
+
+name: Release IPA
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - feature/workflow
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, for example v0.9.5. Leave empty for the latest tag."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-ipa-${{ github.event_name == 'workflow_dispatch' && inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build IPA and publish the release
+    # A normal push to feature/workflow does not publish. A push does when
+    # it changes this file, or the commit message contains [release].
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || startsWith(github.ref, 'refs/tags/')
+      || contains(github.event.head_commit.message, '[release]')
+      || contains(toJSON(github.event.commits), '.github/workflows/release.yml')
+      || contains(toJSON(github.event.head_commit.added), '.github/workflows/release.yml')
+      || contains(toJSON(github.event.head_commit.modified), '.github/workflows/release.yml')
+    runs-on: xcode-27
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Select Xcode 27.2
+        run: |
+          set -euo pipefail
+          xcode_app=/Applications/Xcode_27.2.app
+          if [[ ! -d "$xcode_app" ]]; then
+            echo "Xcode 27.2 is not installed on this runner." >&2
+            ls /Applications | grep -i xcode || true
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode_app"
+          xcodebuild -version
+          sdk_version=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iPhoneOS SDK ${sdk_version}"
+          if [[ "$sdk_version" != 27.2 && "$sdk_version" != 27.2.* ]]; then
+            echo "iPhoneOS SDK ${sdk_version} is not 27.2." >&2
+            exit 1
+          fi
+
+      - name: Choose the tag and check it out
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || '' }}
+        run: |
+          set -euo pipefail
+          tag=$(python3 - "$REQUESTED_TAG" <<'PY'
+          import json, os, re, sys
+          from pathlib import Path
+          requested = "".join(sys.argv[1].split())
+          if requested:
+              print(requested)
+              raise SystemExit(0)
+          if os.environ["GITHUB_REF"].startswith("refs/tags/"):
+              print(os.environ["GITHUB_REF_NAME"])
+              raise SystemExit(0)
+          message = ""
+          event_path = os.environ.get("GITHUB_EVENT_PATH", "")
+          if event_path:
+              event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+              message = ((event.get("head_commit") or {}).get("message")) or ""
+          match = re.search(r"\[release\s+(v[0-9]+(?:\.[0-9]+)*)\]", message)
+          print(match.group(1) if match else "")
+          PY
+          )
+          if [[ -z "$tag" ]]; then
+            tag=$(git tag -l 'v*' --sort=-v:refname | while read -r candidate; do
+              if [[ "$candidate" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+                printf '%s\n' "$candidate"
+                break
+              fi
+            done)
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "Refusing release tag: expected v and numeric segments, for example v0.9.5." >&2
+            exit 1
+          fi
+          git rev-parse --verify "refs/tags/${tag}^{commit}" >/dev/null
+          git checkout --detach "refs/tags/${tag}"
+          version="${tag#v}"
+          plist_version=$(plutil -extract CFBundleShortVersionString raw -o - Info.plist)
+          if [[ "$version" != "$plist_version" ]]; then
+            echo "Tag ${tag} does not match Info.plist CFBundleShortVersionString ${plist_version}." >&2
+            exit 1
+          fi
+          echo "Publishing ${tag} ($(git rev-parse HEAD))"
+          printf 'RELEASE_TAG=%s\n' "$tag" >> "$GITHUB_ENV"
+          printf 'RELEASE_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+
+      - name: Build the IPA
+        run: |
+          set -euo pipefail
+          ipa="${RUNNER_TEMP}/WQFiles.ipa"
+          # Skip tests/run_all_tests.sh. WQScanInodeCheckpointTests deadlocks on
+          # this 3-core runner (gap-crash waits forever for a second worker), and
+          # the suite's 900s watchdog then fails the job before clang runs.
+          # WQ_SKIP_PREFLIGHT is build.sh's own bypass; the tagged script is not edited.
+          WQ_SKIP_PREFLIGHT=1 WQFILES_FINAL_IPA="$ipa" ./build.sh
+          test -f "$ipa"
+          shasum -a 256 "$ipa"
+
+      - name: Publish to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ipa="${RUNNER_TEMP}/WQFiles.ipa"
+          test -f "$ipa"
+          sha=$(shasum -a 256 "$ipa" | awk '{print $1}')
+          commit=$(git rev-parse HEAD)
+          title="Worse Query Files ${RELEASE_VERSION}"
+          old_name="WQFiles_${RELEASE_TAG}.ipa"
+          tree_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${RELEASE_TAG}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          notes="${RUNNER_TEMP}/release-notes.md"
+          notice="${RUNNER_TEMP}/actions-notice.md"
+          existing=0
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            existing=1
+            gh release view "$RELEASE_TAG" --json body --jq '.body // ""' > "$notes"
+          else
+            src="RELEASE_NOTES_${RELEASE_VERSION}.md"
+            if [[ -f "$src" ]]; then
+              cp "$src" "$notes"
+            else
+              printf '%s\n' "$title" > "$notes"
+            fi
+          fi
+          # Quoted delimiter so the notice text is literal. The tag, commit, and
+          # URLs are expanded by printf, not by the shell's heredoc.
+          printf '%s\n' \
+            '<!-- wqfiles-actions-notice -->' \
+            "> This \`WQFiles.ipa\` is 100% built by GitHub Actions from the source code you see at [${RELEASE_TAG}](${tree_url}) (\`${commit}\`). Nothing was added after that build. [View the build](${run_url})." \
+            '<!-- /wqfiles-actions-notice -->' \
+            > "$notice"
+
+          python3 - "$notes" "$sha" "$notice" <<'PY'
+          import pathlib, re, sys
+          notes_path, sha, notice_path = sys.argv[1:]
+          text = pathlib.Path(notes_path).read_text(encoding="utf-8")
+          notice = pathlib.Path(notice_path).read_text(encoding="utf-8").strip() + "\n\n"
+          block = re.compile(
+              r"<!-- wqfiles-actions-notice -->.*?<!-- /wqfiles-actions-notice -->\n*",
+              re.DOTALL,
+          )
+          text = block.sub("", text).lstrip("\n")
+          text = notice + text
+          line = f"SHA-256 of WQFiles.ipa: `{sha}`"
+          pattern = re.compile(r"^SHA-256 of WQFiles\.ipa: `[^`]*`\s*$", re.MULTILINE)
+          if pattern.search(text):
+              text = pattern.sub(line, text, count=1)
+          else:
+              if not text.endswith("\n"):
+                  text += "\n"
+              text += "\n" + line + "\n"
+          pathlib.Path(notes_path).write_text(text, encoding="utf-8")
+          PY
+
+          if [[ "$existing" -eq 1 ]]; then
+            gh release upload "$RELEASE_TAG" "$ipa" --clobber
+            gh release edit "$RELEASE_TAG" --title "$title" --notes-file "$notes"
+          else
+            gh release create "$RELEASE_TAG" "$ipa" \
+              --title "$title" \
+              --notes-file "$notes" \
+              --verify-tag
+          fi
+
+          url=$(python3 - "$RELEASE_TAG" "$old_name" "$title" <<'PY'
+          import json, subprocess, sys
+          tag, old_name, title = sys.argv[1:]
+
+          def view():
+              return json.loads(subprocess.check_output(
+                  ["gh", "release", "view", tag, "--json", "name,assets,url"],
+                  text=True,
+              ))
+
+          release = view()
+          names = [asset["name"] for asset in release["assets"]]
+          if old_name in names:
+              subprocess.check_call(
+                  ["gh", "release", "delete-asset", tag, old_name, "--yes"],
+                  stdout=subprocess.DEVNULL)
+              release = view()
+              names = [asset["name"] for asset in release["assets"]]
+          if release["name"] != title:
+              raise SystemExit(
+                  f"release title is {release['name']!r}, expected {title!r}")
+          if "WQFiles.ipa" not in names:
+              raise SystemExit("WQFiles.ipa was not published")
+          if old_name in names:
+              raise SystemExit(f"tag-named IPA is still on the release: {old_name}")
+          print(release["url"])
+          PY
+          )
+          {
+            echo "### ${title}"
+            echo
+            echo "Published to ${url}"
+            echo
+            echo "- \`WQFiles.ipa\`"
+            echo "- SHA-256: \`${sha}\`"
+            echo "- Built from \`${commit}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
